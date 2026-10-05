@@ -195,12 +195,15 @@
   .drop strong{display:block;font-family:var(--serif);font-weight:400;font-size:36px;line-height:1.1}
   .drop .mono{color:var(--muted);display:block;margin-top:12px}
   .files{list-style:none;display:grid;gap:8px}
-  .files li{display:grid;grid-template-columns:46px 1fr auto auto;gap:14px;align-items:center;border:1px solid var(--line);padding:12px 14px;background:var(--bg2);font-size:14.5px;position:relative;overflow:hidden}
+  .files li{display:grid;grid-template-columns:46px 1fr auto auto auto;gap:14px;align-items:center;border:1px solid var(--line);padding:12px 14px;background:var(--bg2);font-size:14.5px;position:relative;overflow:hidden}
   .files li .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;position:relative;z-index:1}
   .files li .sz,.files li .st{font-family:var(--mono);font-size:12px;color:var(--muted);position:relative;z-index:1}
   .files li .st.ok{color:#7bd88f} .files li .st.err{color:var(--red)}
   .files li .bar{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(163,50,50,.28);transition:width .3s}
-  .files li button{background:none;border:0;color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:14px;position:relative;z-index:1}
+  .files li button{background:none;border:0;color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:14px;position:relative;z-index:3;width:32px;height:32px;margin:-8px -8px -8px 0;display:grid;place-items:center}
+  .files li .st:empty{display:none}
+  .files li.cancelled{opacity:.45}
+  .files li.cancelled .bar{background:rgba(149,140,134,.12)}
   .files li button:hover{color:var(--red-dull-text)}
   /* film-reel icon + wisps rising from the bar's leading edge while uploading */
   .reel{width:42px;height:28px;border:1px solid var(--muted);overflow:hidden;position:relative;background:#000;z-index:1;opacity:.55;transition:opacity .4s,border-color .4s}
@@ -277,7 +280,7 @@
     .lamp figcaption{display:none}
     .story h2{margin-top:.2em}
   }
-  @media (max-width:480px){.wrap{padding:0 16px}.files li{grid-template-columns:46px 1fr auto}.files li .sz{display:none}}
+  @media (max-width:480px){.wrap{padding:0 16px}.files li{grid-template-columns:46px 1fr auto auto}.files li .sz{display:none}}
   @media (prefers-reduced-motion:reduce){
     *,*::before,*::after{animation:none!important;transition:none!important}
     .rv{opacity:1;filter:none;transform:none}
@@ -580,10 +583,18 @@ function render() {
     const li = document.createElement("li");
     li.id = "f-" + item.id;
     li.innerHTML = `<div class="bar"></div><div class="edge" aria-hidden="true"><span></span><span></span><span></span><span></span></div><span class="reel" aria-hidden="true"><span class="strip"></span></span><span class="nm"></span><span class="sz">${fmt(item.file.size)}</span>` +
-      (uploading ? `<span class="st">Waiting</span>` : `<button type="button" aria-label="Remove">✕</button>`);
+      (uploading ? `<span class="st">Waiting</span><button type="button" class="x" aria-label="Cancel this upload" title="Cancel this upload">✕</button>` : `<span class="st"></span><button type="button" class="x" aria-label="Remove" title="Remove">✕</button>`);
     li.querySelector(".nm").textContent = item.file.name;
     const rm = li.querySelector("button");
-    if (rm) rm.onclick = () => { files = files.filter((x) => x !== item); render(); };
+    if (rm) rm.onclick = () => {
+      if (!uploading) { files = files.filter((x) => x !== item); render(); return; }
+      if (item.finished) return;
+      item.cancelled = true;
+      if (item.xhr) item.xhr.abort();
+      li.classList.remove("up"); li.classList.add("cancelled");
+      const st = li.querySelector(".st"); st.textContent = "Cancelled"; st.className = "st";
+      rm.remove();
+    };
     list.appendChild(li);
   }
 }
@@ -607,9 +618,11 @@ async function api(path, body) {
   return data;
 }
 
-function putChunk(url, blob, onProgress) {
+function putChunk(url, blob, onProgress, item) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    if (item) item.xhr = xhr;
+    xhr.onabort = () => { const e = new Error("Cancelled"); e.cancelled = true; reject(e); };
     xhr.open("PUT", url);
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded);
     xhr.onload = () => {
@@ -632,6 +645,7 @@ async function uploadFile(item, submissionId) {
   let done = 0;
   try {
     for (let n = 1; n <= total; n++) {
+      if (item.cancelled) { const e = new Error("Cancelled"); e.cancelled = true; throw e; }
       const chunk = f.slice((n - 1) * partSize, Math.min(n * partSize, f.size));
       const url = `${CONFIG.WORKER_URL}/file/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&part=${n}`;
       let attempt = 0, res;
@@ -640,10 +654,10 @@ async function uploadFile(item, submissionId) {
           res = await putChunk(url, chunk, (loaded) => {
             const pct = Math.min(99, ((done + loaded) / f.size) * 100);
             bar.style.width = pct + "%"; li.style.setProperty("--p", pct + "%"); st.textContent = Math.floor(pct) + "%";
-          });
+          }, item);
           break;
         } catch (e) {
-          if (++attempt >= 4) throw e;
+          if (e.cancelled || item.cancelled || ++attempt >= 4) throw e;
           st.textContent = `Retrying (${attempt})`;
           await new Promise((r) => setTimeout(r, 1500 * attempt));
         }
@@ -653,10 +667,13 @@ async function uploadFile(item, submissionId) {
     }
     st.textContent = "Finishing";
     await api("/file/complete", { key, uploadId, parts });
+    item.finished = true; li.querySelector(".x")?.remove();
     bar.style.width = "100%"; li.classList.remove("up"); li.classList.add("done"); st.textContent = "Done ✓"; st.classList.add("ok");
   } catch (e) {
     api("/file/abort", { key, uploadId }).catch(() => {});
-    li.classList.remove("up"); st.textContent = "Failed"; st.classList.add("err");
+    li.classList.remove("up");
+    if (e.cancelled || item.cancelled) { li.classList.add("cancelled"); st.textContent = "Cancelled"; st.className = "st"; li.querySelector(".x")?.remove(); return "cancelled"; }
+    st.textContent = "Failed"; st.classList.add("err"); li.querySelector(".x")?.remove();
     throw e;
   }
 }
@@ -686,12 +703,23 @@ form.addEventListener("submit", async (e) => {
       links, fileCount: files.length,
       termsVersion: CONFIG.TERMS_VERSION, clientTime: new Date().toISOString() + " " + Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
-    let failed = 0;
+    let failed = 0, sent = 0;
     for (const item of files) {
-      try { await uploadFile(item, submissionId); } catch (x) { failed++; err.textContent = `${item.file.name}: ${x.message}`; }
+      if (item.cancelled) continue;
+      try { if ((await uploadFile(item, submissionId)) !== "cancelled") sent++; }
+      catch (x) { failed++; err.textContent = `${item.file.name}: ${x.message}`; }
     }
     uploading = false;
-    if (files.length && failed === files.length && !links.length) throw new Error(err.textContent || "Upload failed.");
+    if (!sent && !links.length) {
+      if (!failed) {
+        // everything was cancelled: let them start again
+        files = files.filter((f) => !f.cancelled); render();
+        form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = false));
+        btn.disabled = false; statusEl.textContent = "Upload cancelled. Add videos and send again whenever you're ready.";
+        return;
+      }
+      throw new Error(err.textContent || "Upload failed.");
+    }
     $("#ref").textContent = submissionId;
     form.classList.add("hide"); $("#done").classList.remove("hide"); $("#done").focus();
     if (failed) $("#done p").insertAdjacentHTML("afterend", `<p class="red">${failed} file(s) didn't upload. Use "Send more footage" to try them again.</p>`);
@@ -701,7 +729,7 @@ form.addEventListener("submit", async (e) => {
     statusEl.textContent = "Something went wrong. Please try again.";
     form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = false));
     btn.disabled = false;
-    files.forEach((f) => (f.done = false)); render();
+    files = files.filter((f) => !f.finished); files.forEach((f) => { f.cancelled = false; f.xhr = null; }); render();
   }
 });
 
