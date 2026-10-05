@@ -203,6 +203,7 @@
   .files li button{background:none;border:0;color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:14px;position:relative;z-index:3;width:32px;height:32px;margin:-8px -8px -8px 0;display:grid;place-items:center}
   .files li .st:empty{display:none}
   .files li.cancelled{opacity:.45}
+  .files.locked .x{visibility:hidden}
   .files li.cancelled .bar{background:rgba(149,140,134,.12)}
   .files li button:hover{color:var(--red-dull-text)}
   /* film-reel icon + wisps rising from the bar's leading edge while uploading */
@@ -476,7 +477,7 @@
       <p class="err-msg" id="err" role="alert"></p>
       <div class="submit-row">
         <button class="btn" type="submit" id="submitBtn">Send my moment <span>→</span></button>
-        <span class="mono" id="status">Keep this tab open until every file says done</span>
+        <span class="mono" id="status">Videos start uploading as soon as you add them. Keep this tab open.</span>
       </div>
     </form>
 
@@ -555,8 +556,11 @@ const CONFIG = {
 const $ = (s, r = document) => r.querySelector(s);
 const form = $("#form"), drop = $("#drop"), input = $("#fileInput"), list = $("#fileList");
 const err = $("#err"), btn = $("#submitBtn"), statusEl = $("#status");
-let files = [];
-let uploading = false;
+let files = [];          // { file, id, state: queued|uploading|done|failed, li, xhr, key, uploadId, cancelled }
+let draftId = null, draftPromise = null;
+let pumping = false, sending = false, idleWaiters = [];
+const busy = () => files.some((f) => f.state === "queued" || f.state === "uploading");
+const IDLE_MSG = "Videos start uploading as soon as you add them. Keep this tab open.";
 
 if (CONFIG.CONTACT_EMAIL !== "CONTACT_EMAIL_HERE") {
   const a = $("#contactLink"); a.href = "mailto:" + CONFIG.CONTACT_EMAIL; a.textContent = CONFIG.CONTACT_EMAIL;
@@ -572,31 +576,71 @@ function addFiles(incoming) {
     if (f.size > CONFIG.MAX_FILE_BYTES) { err.textContent = `"${f.name}" is over 4 GB. Please trim it.`; continue; }
     if (files.some((x) => x.file.name === f.name && x.file.size === f.size)) continue;
     if (files.length >= CONFIG.MAX_FILES) { err.textContent = `Up to ${CONFIG.MAX_FILES} files per submission.`; break; }
-    files.push({ file: f, id: crypto.randomUUID() });
+    const item = { file: f, id: crypto.randomUUID(), state: "queued" };
+    files.push(item); addRow(item);
   }
-  render();
+  pump();
 }
 
-function render() {
-  list.innerHTML = "";
-  for (const item of files) {
-    const li = document.createElement("li");
-    li.id = "f-" + item.id;
-    li.innerHTML = `<div class="bar"></div><div class="edge" aria-hidden="true"><span></span><span></span><span></span><span></span></div><span class="reel" aria-hidden="true"><span class="strip"></span></span><span class="nm"></span><span class="sz">${fmt(item.file.size)}</span>` +
-      (uploading ? `<span class="st">Waiting</span><button type="button" class="x" aria-label="Cancel this upload" title="Cancel this upload">✕</button>` : `<span class="st"></span><button type="button" class="x" aria-label="Remove" title="Remove">✕</button>`);
-    li.querySelector(".nm").textContent = item.file.name;
-    const rm = li.querySelector("button");
-    if (rm) rm.onclick = () => {
-      if (!uploading) { files = files.filter((x) => x !== item); render(); return; }
-      if (item.finished) return;
-      item.cancelled = true;
-      if (item.xhr) item.xhr.abort();
-      li.classList.remove("up"); li.classList.add("cancelled");
-      const st = li.querySelector(".st"); st.textContent = "Cancelled"; st.className = "st";
-      rm.remove();
-    };
-    list.appendChild(li);
+function addRow(item) {
+  const li = document.createElement("li");
+  li.id = "f-" + item.id; item.li = li;
+  li.innerHTML = `<div class="bar"></div><div class="edge" aria-hidden="true"><span></span><span></span><span></span><span></span></div><span class="reel" aria-hidden="true"><span class="strip"></span></span><span class="nm"></span><span class="sz">${fmt(item.file.size)}</span><span class="st">Waiting</span><button type="button" class="x" aria-label="Remove this video" title="Remove">✕</button>`;
+  li.querySelector(".nm").textContent = item.file.name;
+  li.querySelector(".x").onclick = () => removeItem(item);
+  list.appendChild(li);
+}
+
+// ✕ on a row: stop it if it's uploading, delete it from storage if it already finished, then drop the row
+function removeItem(item) {
+  if (sending) return;
+  item.cancelled = true;
+  if (item.xhr) item.xhr.abort();
+  if (item.key && draftId) api("/file/delete", { key: item.key }).catch(() => {});
+  files = files.filter((x) => x !== item);
+  item.li.remove();
+  updateStatus();
+}
+
+function updateStatus() {
+  if (sending) return;
+  const total = files.length, done = files.filter((f) => f.state === "done").length;
+  if (!total) statusEl.textContent = IDLE_MSG;
+  else if (busy()) statusEl.textContent = `Uploading ${Math.min(done + 1, total)} of ${total}… fill in your details meanwhile`;
+  else if (done) statusEl.textContent = `${done} video${done > 1 ? "s" : ""} uploaded. Press send to finish.`;
+}
+
+function ensureDraft() {
+  if (draftId) return Promise.resolve(draftId);
+  if (!draftPromise) draftPromise = api("/draft", {}).then((r) => (draftId = r.submissionId)).finally(() => (draftPromise = null));
+  return draftPromise;
+}
+
+// uploads run one at a time, in the order they were added
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    let item;
+    while ((item = files.find((f) => f.state === "queued"))) {
+      updateStatus();
+      try { await ensureDraft(); }
+      catch (e) { item.state = "failed"; markFailed(item, e); continue; }
+      await uploadFile(item);
+    }
+  } finally {
+    pumping = false; updateStatus();
+    idleWaiters.splice(0).forEach((r) => r());
   }
+}
+const whenIdle = () => (busy() || pumping ? new Promise((r) => idleWaiters.push(r)) : Promise.resolve());
+
+function markFailed(item, e) {
+  if (!item.li.isConnected) return;
+  const st = item.li.querySelector(".st");
+  item.li.classList.remove("up");
+  st.textContent = "Failed"; st.className = "st err"; st.title = e.message;
+  err.textContent = `${item.file.name}: ${e.message}. Tap ✕ and add it again to retry.`;
 }
 
 input.addEventListener("change", () => { addFiles(input.files); input.value = ""; });
@@ -609,7 +653,8 @@ form.querySelectorAll("input[name=ageStatus]").forEach((r) =>
 form.querySelectorAll("input[name=credit]").forEach((r) =>
   r.addEventListener("change", () => $("#creditNameWrap").classList.toggle("hide", form.credit.value === "anonymous")));
 
-window.addEventListener("beforeunload", (e) => { if (uploading) { e.preventDefault(); e.returnValue = ""; } });
+// warn before leaving while uploading, or when videos are uploaded but the form wasn't sent
+window.addEventListener("beforeunload", (e) => { if (busy() || (files.length && !form.classList.contains("hide"))) { e.preventDefault(); e.returnValue = ""; } });
 
 async function api(path, body) {
   const res = await fetch(CONFIG.WORKER_URL + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -634,18 +679,22 @@ function putChunk(url, blob, onProgress, item) {
   });
 }
 
-async function uploadFile(item, submissionId) {
-  const li = $("#f-" + item.id), bar = li.querySelector(".bar"), st = li.querySelector(".st");
+async function uploadFile(item) {
+  const li = item.li, bar = li.querySelector(".bar"), st = li.querySelector(".st");
   const f = item.file;
+  item.state = "uploading";
   st.textContent = "Starting";
-  const { key, uploadId, partSize } = await api("/file/init", { submissionId, name: f.name, size: f.size, type: f.type });
-  li.classList.add("up");
-  const total = Math.max(1, Math.ceil(f.size / partSize));
-  const parts = [];
-  let done = 0;
+  let key, uploadId, partSize;
   try {
+    ({ key, uploadId, partSize } = await api("/file/init", { submissionId: draftId, name: f.name, size: f.size, type: f.type }));
+    item.key = key; item.uploadId = uploadId;
+    if (item.cancelled) throw Object.assign(new Error("Cancelled"), { cancelled: true });
+    li.classList.add("up");
+    const total = Math.max(1, Math.ceil(f.size / partSize));
+    const parts = [];
+    let done = 0;
     for (let n = 1; n <= total; n++) {
-      if (item.cancelled) { const e = new Error("Cancelled"); e.cancelled = true; throw e; }
+      if (item.cancelled) throw Object.assign(new Error("Cancelled"), { cancelled: true });
       const chunk = f.slice((n - 1) * partSize, Math.min(n * partSize, f.size));
       const url = `${CONFIG.WORKER_URL}/file/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&part=${n}`;
       let attempt = 0, res;
@@ -667,19 +716,26 @@ async function uploadFile(item, submissionId) {
     }
     st.textContent = "Finishing";
     await api("/file/complete", { key, uploadId, parts });
-    item.finished = true; li.querySelector(".x")?.remove();
+    item.state = "done"; item.xhr = null;
+    if (item.cancelled) { api("/file/delete", { key }).catch(() => {}); return; }
     bar.style.width = "100%"; li.classList.remove("up"); li.classList.add("done"); st.textContent = "Done ✓"; st.classList.add("ok");
   } catch (e) {
-    api("/file/abort", { key, uploadId }).catch(() => {});
-    li.classList.remove("up");
-    if (e.cancelled || item.cancelled) { li.classList.add("cancelled"); st.textContent = "Cancelled"; st.className = "st"; li.querySelector(".x")?.remove(); return "cancelled"; }
-    st.textContent = "Failed"; st.classList.add("err"); li.querySelector(".x")?.remove();
-    throw e;
+    item.xhr = null;
+    if (key) api("/file/delete", { key }).catch(() => {});
+    item.key = null;
+    if (e.cancelled || item.cancelled) { item.state = "cancelled"; return; }
+    item.state = "failed"; markFailed(item, e);
   }
+}
+
+function lockForm(locked) {
+  form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = locked));
+  btn.disabled = locked;
 }
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (sending) return;
   err.textContent = "";
   const d = new FormData(form);
   if (!d.get("name")?.trim()) return (err.textContent = "Please enter your name.");
@@ -691,53 +747,45 @@ form.addEventListener("submit", async (e) => {
   if (!files.length && !links.length) return (err.textContent = "Add at least one video, or paste a link.");
   if (!form.agreeRelease.checked || !form.agreePeople.checked) return (err.textContent = "Please tick both consent boxes to continue.");
 
-  uploading = true; btn.disabled = true; render();
-  form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = true));
-  statusEl.textContent = "Uploading… keep this tab open";
+  sending = true; lockForm(true);
+  list.classList.add("locked");
   try {
-    const { submissionId } = await api("/submission", {
+    if (busy() || pumping) {
+      statusEl.textContent = "Finishing your uploads… keep this tab open";
+      await whenIdle();
+    }
+    const sent = files.filter((f) => f.state === "done").length;
+    const failed = files.filter((f) => f.state === "failed").length;
+    if (!sent && !links.length) throw new Error("Your videos didn't upload. Remove them with ✕, add them again, then press send.");
+    statusEl.textContent = "Sending…";
+    await ensureDraft();
+    await api("/submission/finalize", {
+      submissionId: draftId,
       name: d.get("name"), email: d.get("email"), city: d.get("city"), instagram: d.get("instagram"),
       credit: d.get("credit"), creditName: d.get("creditName"), note: d.get("note"),
       ageStatus: d.get("ageStatus"), guardianOf: d.get("guardianOf"),
       agreeRelease: true, agreePeople: true, marketingOptIn: form.marketingOptIn.checked,
-      links, fileCount: files.length,
+      links,
       termsVersion: CONFIG.TERMS_VERSION, clientTime: new Date().toISOString() + " " + Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
-    let failed = 0, sent = 0;
-    for (const item of files) {
-      if (item.cancelled) continue;
-      try { if ((await uploadFile(item, submissionId)) !== "cancelled") sent++; }
-      catch (x) { failed++; err.textContent = `${item.file.name}: ${x.message}`; }
-    }
-    uploading = false;
-    if (!sent && !links.length) {
-      if (!failed) {
-        // everything was cancelled: let them start again
-        files = files.filter((f) => !f.cancelled); render();
-        form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = false));
-        btn.disabled = false; statusEl.textContent = "Upload cancelled. Add videos and send again whenever you're ready.";
-        return;
-      }
-      throw new Error(err.textContent || "Upload failed.");
-    }
-    $("#ref").textContent = submissionId;
+    $("#ref").textContent = draftId;
     form.classList.add("hide"); $("#done").classList.remove("hide"); $("#done").focus();
-    if (failed) $("#done p").insertAdjacentHTML("afterend", `<p class="red">${failed} file(s) didn't upload. Use "Send more footage" to try them again.</p>`);
+    if (failed) $("#done p").insertAdjacentHTML("afterend", `<p class="red">${failed} video(s) didn't upload. Use "Send another moment" to try them again.</p>`);
   } catch (x) {
-    uploading = false;
     err.textContent = x.message;
-    statusEl.textContent = "Something went wrong. Please try again.";
-    form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = false));
-    btn.disabled = false;
-    files = files.filter((f) => !f.finished); files.forEach((f) => { f.cancelled = false; f.xhr = null; }); render();
+    lockForm(false);
+    updateStatus();
+  } finally {
+    sending = false; list.classList.remove("locked");
   }
 });
 
 $("#again").onclick = () => {
-  files = []; render(); form.links.value = ""; $("#done").classList.add("hide"); form.classList.remove("hide");
-  form.querySelectorAll("input,textarea").forEach((el) => (el.disabled = false));
+  files = []; list.innerHTML = ""; draftId = null; form.links.value = "";
+  $("#done").classList.add("hide"); form.classList.remove("hide");
+  lockForm(false);
   form.agreeRelease.checked = false; form.agreePeople.checked = false;
-  btn.disabled = false; statusEl.textContent = "Keep this tab open until every file says done";
+  statusEl.textContent = IDLE_MSG;
   $("#upload").scrollIntoView();
 };
 </script>
